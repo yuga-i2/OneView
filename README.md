@@ -19,7 +19,8 @@ The same institution can have complaints open with several Bureaus at once, such
 - **Case actions.** Register, transfer, escalate and dispose of cases. Every action is saved in an append-only history on the case.
 - **Timeline tracking.** Expected disposal dates, SLA flags, overdue and due-soon alerts, and an ageing view.
 - **Dashboard.** Weekly intake by Bureau, open caseload, status split, regional view and a needs-attention list.
-- **Search, filters and export.** Filter by Bureau, region, category, status and age. Export to CSV.
+- **Documents.** Officers attach files (PDF, image, Word, Excel, text, up to 5 MB) to a case. Attachments are logged in the case history.
+- **Reports and export.** Monthly and quarterly reports as Excel or PDF, a full case export to Excel and CSV, plus filters by Bureau, region, category, status and age.
 - **Roles.** Officers act only on their own Bureau's cases. Senior management and regional offices have read-only views.
 
 ## Quick start
@@ -65,14 +66,14 @@ Password for every account: `demo123`
 | Part | Technology |
 |---|---|
 | Frontend | Plain HTML, CSS and JavaScript, with SVG charts. No build step. |
-| Backend | Python, FastAPI |
+| Backend | Python, FastAPI, openpyxl (Excel), reportlab (PDF) |
 | Database | SQLite (PostgreSQL is the planned next step) |
 | Auth | Signed tokens, PBKDF2 password hashing |
 
 ```
 oneview/
 ├── backend/
-│   ├── main.py            API, matching logic, database setup and sample data
+│   ├── main.py            API, matching logic, reports, uploads, sample data
 │   └── requirements.txt
 ├── frontend/
 │   ├── index.html         Landing page, login and dashboard (single file)
@@ -101,14 +102,15 @@ All endpoints except login need the token returned by `POST /api/login`. Full de
 | GET | `/api/stats` | Dashboard figures |
 | GET | `/api/reports/{dimension}` | Reports by Bureau, region and more |
 | GET | `/api/export.csv` | CSV export |
+| GET | `/api/export.xlsx` | Excel export of all cases |
+| GET | `/api/report-file?period=monthly&fmt=pdf` | Monthly or quarterly report (`period`: monthly, quarterly; `fmt`: xlsx, pdf) |
+| GET / POST | `/api/cases/{id}/documents` | List or attach documents |
+| GET | `/api/documents/{id}` | Download a document |
 
 ## Not built yet
 
-- Email and in-app notifications
-- Document upload
-- Monthly and quarterly report generation
-- PDF and Excel export
-- Import from existing AICTE systems
+- Email notifications (the bell shows in-app overdue and overlap alerts)
+- Import from existing AICTE systems (needs access to those systems)
 - PostgreSQL migration
 - AI-based text similarity (matching today is rule-based)
 

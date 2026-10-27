@@ -215,8 +215,80 @@ def export(u=Depends(current_user)):
     for c in all_cases(): w.writerow([c["id"], c["inst_name"], c["inst_id"], c["region"], c["bureau"], c["category"], c["status"], c["officer"], c["received"][:10], c["age"], c["overdue"]])
     f.seek(0); return StreamingResponse(iter([f.read()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=oneview_cases.csv"})
 
+# ---------- Excel / PDF export, periodic reports, document upload ----------
+UPLOADS = os.path.join(HERE, "uploads")
+ALLOWED = {".pdf", ".png", ".jpg", ".jpeg", ".docx", ".xlsx", ".txt"}
+MAX_UPLOAD = 5 * 1024 * 1024
+def _case_rows(cs): return [[c["id"], c["inst_name"], c["inst_id"], c["region"], c["bureau"], c["category"], c["status"], c["officer"], c["received"][:10], c["age"], "Yes" if c["overdue"] else "No"] for c in cs]
+CASE_HEAD = ["Case ID", "Institution", "Permanent ID", "Region", "Bureau", "Category", "Status", "Officer", "Received", "Age (days)", "Overdue"]
+def _period(c, p):
+    d = datetime.fromisoformat(c["received"]); return f"{d.year}-{d.month:02d}" if p == "monthly" else f"{d.year}-Q{(d.month - 1) // 3 + 1}"
+def _summary(p):
+    g = {}
+    for c in all_cases(): g.setdefault(_period(c, p), []).append(c)
+    return [[k, len(v), sum(c["status"] == "Disposed" for c in v), sum(c["status"] != "Disposed" for c in v), sum(c["overdue"] for c in v)] for k, v in sorted(g.items(), reverse=True)]
+SUM_HEAD = ["Period", "Received", "Disposed", "Still open", "Overdue"]
+
+@app.get("/api/export.xlsx")
+def export_xlsx(u=Depends(current_user)):
+    from openpyxl import Workbook
+    wb = Workbook(); ws = wb.active; ws.title = "Cases"; ws.append(CASE_HEAD)
+    for r in _case_rows(all_cases()): ws.append(r)
+    for col, w in zip("ABCDEFGHIJK", (16, 44, 14, 12, 18, 26, 14, 16, 12, 11, 9)): ws.column_dimensions[col].width = w
+    f = io.BytesIO(); wb.save(f); f.seek(0)
+    return StreamingResponse(f, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": "attachment; filename=oneview_cases.xlsx"})
+
+@app.get("/api/report-file")
+def report_file(period: str = "monthly", fmt: str = "xlsx", u=Depends(current_user)):
+    if period not in ("monthly", "quarterly") or fmt not in ("xlsx", "pdf"): raise HTTPException(422, "period: monthly|quarterly, fmt: xlsx|pdf")
+    rows, name = _summary(period), f"oneview_{period}_report"
+    if fmt == "xlsx":
+        from openpyxl import Workbook
+        wb = Workbook(); ws = wb.active; ws.title = period.title(); ws.append(SUM_HEAD)
+        for r in rows: ws.append(r)
+        ws2 = wb.create_sheet("Cases"); ws2.append(CASE_HEAD)
+        for r in _case_rows(all_cases()): ws2.append(r)
+        f = io.BytesIO(); wb.save(f); f.seek(0)
+        return StreamingResponse(f, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename={name}.xlsx"})
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    f = io.BytesIO(); st = getSampleStyleSheet()
+    t = Table([SUM_HEAD] + rows, hAlign="LEFT"); t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0e7a5f")), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), .5, colors.HexColor("#d5d9df")), ("ALIGN", (1, 0), (-1, -1), "CENTER")]))
+    SimpleDocTemplate(f, pagesize=A4).build([Paragraph(f"AICTE OneView - {period} report", st["Title"]), Paragraph(f"Generated {now().strftime('%d %b %Y')}. Synthetic sample data.", st["Normal"]), Spacer(1, 14), t])
+    f.seek(0); return StreamingResponse(f, media_type="application/pdf", headers={"Content-Disposition": f"attachment; filename={name}.pdf"})
+
+class Doc(BaseModel): filename: str; content_b64: str
+@app.get("/api/cases/{cid}/documents")
+def list_docs(cid: str, u=Depends(current_user)):
+    return q("SELECT id,filename,size,by_user,ts FROM documents WHERE case_id=? ORDER BY id DESC", (cid,))
+@app.post("/api/cases/{cid}/documents")
+def add_doc(cid: str, b: Doc, u=Depends(current_user)):
+    c = next((c for c in all_cases() if c["id"] == cid), None)
+    if not c: raise HTTPException(404, "Case not found")
+    if not can_act(u, c): raise HTTPException(403, f"Only {c['bureau']} officers or admins can attach documents")
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(b.filename))[:80]
+    if os.path.splitext(name)[1].lower() not in ALLOWED: raise HTTPException(422, "Allowed types: " + ", ".join(sorted(ALLOWED)))
+    try: data = base64.b64decode(b.content_b64, validate=True)
+    except Exception: raise HTTPException(422, "Invalid file data")
+    if not data or len(data) > MAX_UPLOAD: raise HTTPException(422, "File must be between 1 byte and 5 MB")
+    os.makedirs(UPLOADS, exist_ok=True)
+    with conn() as cn:
+        i = cn.execute("INSERT INTO documents(case_id,filename,size,by_user,ts) VALUES(?,?,?,?,?)", (cid, name, len(data), u["name"], iso(now()))).lastrowid
+    with open(os.path.join(UPLOADS, f"{i}_{name}"), "wb") as fh: fh.write(data)
+    log(cid, u, "Document attached", name)
+    return {"id": i, "filename": name, "size": len(data)}
+@app.get("/api/documents/{did}")
+def get_doc(did: int, u=Depends(current_user)):
+    d = q("SELECT * FROM documents WHERE id=?", (did,), one=True)
+    if not d: raise HTTPException(404, "Document not found")
+    return StreamingResponse(open(os.path.join(UPLOADS, f"{d['id']}_{d['filename']}"), "rb"), media_type="application/octet-stream", headers={"Content-Disposition": f"attachment; filename={d['filename']}"})
+
 # ---------- schema + synthetic seed ----------
 def init():
+    with conn() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS documents(id INTEGER PRIMARY KEY AUTOINCREMENT,case_id TEXT,filename TEXT,size INT,by_user TEXT,ts TEXT)")
     with conn() as c:
         c.executescript("""CREATE TABLE IF NOT EXISTS institutions(id TEXT PRIMARY KEY,name TEXT,address TEXT,region TEXT);
         CREATE TABLE IF NOT EXISTS users(username TEXT PRIMARY KEY,name TEXT,role TEXT,bureau TEXT,salt TEXT,pw TEXT);
